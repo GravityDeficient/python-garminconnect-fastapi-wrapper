@@ -1,0 +1,15 @@
+services:
+  garmin-api:
+    build: .
+    container_name: garmin-connect-api
+    restart: unless-stopped
+    ports:
+      - "8787:8000"
+    environment:
+      - GARMIN_EMAIL=${GARMIN_EMAIL}
+      - GARMIN_PASSWORD=${GARMIN_PASSWORD}
+      - GARMIN_TOKEN_STORE=/data/tokens
+      - TZ=${TZ:-America/Los_Angeles}
+      - API_KEY=${API_KEY:-}
+    volumes:
+      - ./tokens:/data/tokens

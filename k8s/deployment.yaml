@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: garmin-connect-api
+  labels:
+    app: garmin-connect-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: garmin-connect-api
+  template:
+    metadata:
+      labels:
+        app: garmin-connect-api
+    spec:
+      containers:
+        - name: garmin-connect-api
+          image: ghcr.io/gravitydeficient/garmin-connect-api:latest
+          ports:
+            - containerPort: 8000
+          env:
+            - name: GARMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: garmin-credentials
+                  key: email
+            - name: GARMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: garmin-credentials
+                  key: password
+            - name: GARMIN_TOKEN_STORE
+              value: /data/tokens
+            - name: TZ
+              value: America/Los_Angeles
+          volumeMounts:
+            - name: garmin-tokens
+              mountPath: /data/tokens
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: garmin-tokens
+          secret:
+            secretName: garmin-tokens
