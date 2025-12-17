@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 from datetime import date, timedelta
@@ -9,6 +9,35 @@ import logging
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
 
+# Prometheus metrics (optional)
+ENABLE_PROMETHEUS = os.getenv("ENABLE_PROMETHEUS", "false").lower() == "true"
+if ENABLE_PROMETHEUS:
+    from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+
+    # Define Garmin metrics
+    GARMIN_STEPS = Gauge('garmin_steps_today', 'Total steps today')
+    GARMIN_CALORIES = Gauge('garmin_calories_today', 'Total calories burned today')
+    GARMIN_ACTIVE_CALORIES = Gauge('garmin_active_calories_today', 'Active calories burned today')
+    GARMIN_DISTANCE = Gauge('garmin_distance_meters', 'Distance traveled in meters today')
+    GARMIN_HEART_RATE_RESTING = Gauge('garmin_heart_rate_resting', 'Resting heart rate')
+    GARMIN_HEART_RATE_MIN = Gauge('garmin_heart_rate_min', 'Minimum heart rate today')
+    GARMIN_HEART_RATE_MAX = Gauge('garmin_heart_rate_max', 'Maximum heart rate today')
+    GARMIN_STRESS_AVG = Gauge('garmin_stress_avg', 'Average stress level (0-100)')
+    GARMIN_STRESS_MAX = Gauge('garmin_stress_max', 'Maximum stress level today')
+    GARMIN_BODY_BATTERY = Gauge('garmin_body_battery_current', 'Current body battery level (0-100)')
+    GARMIN_BODY_BATTERY_CHARGED = Gauge('garmin_body_battery_charged', 'Body battery charged today')
+    GARMIN_BODY_BATTERY_DRAINED = Gauge('garmin_body_battery_drained', 'Body battery drained today')
+    GARMIN_SLEEP_SECONDS = Gauge('garmin_sleep_seconds', 'Total sleep duration in seconds')
+    GARMIN_SLEEP_SCORE = Gauge('garmin_sleep_score', 'Sleep score (0-100)')
+    GARMIN_FLOORS_CLIMBED = Gauge('garmin_floors_climbed', 'Floors climbed today')
+    GARMIN_INTENSITY_MINUTES = Gauge('garmin_intensity_minutes', 'Intensity minutes today')
+    GARMIN_SPO2_AVG = Gauge('garmin_spo2_avg', 'Average SpO2 percentage')
+    GARMIN_RESPIRATION_AVG = Gauge('garmin_respiration_avg', 'Average respiration rate')
+    GARMIN_WEIGHT_KG = Gauge('garmin_weight_kg', 'Latest weight in kilograms')
+    GARMIN_BMI = Gauge('garmin_bmi', 'Body mass index')
+    GARMIN_BODY_FAT_PCT = Gauge('garmin_body_fat_percentage', 'Body fat percentage')
+    GARMIN_CONNECTED = Gauge('garmin_connected', 'Garmin client connection status (1=connected, 0=disconnected)')
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -16,7 +45,7 @@ logger = logging.getLogger(__name__)
 API_KEY = os.getenv("API_KEY")
 
 # Paths that don't require authentication
-PUBLIC_PATHS = {"/health", "/docs", "/redoc", "/openapi.json"}
+PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/redoc", "/openapi.json"}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -462,3 +491,126 @@ async def get_today_summary(client: Garmin = Depends(get_client)):
         summary["steps"] = None
 
     return summary
+
+
+# ============ Prometheus Metrics ============
+
+if ENABLE_PROMETHEUS:
+    @app.get("/metrics")
+    async def prometheus_metrics():
+        """Prometheus metrics endpoint for Garmin health data."""
+        global garmin_client
+
+        # Set connection status
+        GARMIN_CONNECTED.set(1 if garmin_client else 0)
+
+        if garmin_client is None:
+            return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+        today = date.today().isoformat()
+
+        # Fetch daily stats
+        try:
+            stats = garmin_client.get_stats(today)
+            if stats:
+                if stats.get("totalSteps"):
+                    GARMIN_STEPS.set(stats["totalSteps"])
+                if stats.get("totalKilocalories"):
+                    GARMIN_CALORIES.set(stats["totalKilocalories"])
+                if stats.get("activeKilocalories"):
+                    GARMIN_ACTIVE_CALORIES.set(stats["activeKilocalories"])
+                if stats.get("totalDistanceMeters"):
+                    GARMIN_DISTANCE.set(stats["totalDistanceMeters"])
+                if stats.get("restingHeartRate"):
+                    GARMIN_HEART_RATE_RESTING.set(stats["restingHeartRate"])
+                if stats.get("minHeartRate"):
+                    GARMIN_HEART_RATE_MIN.set(stats["minHeartRate"])
+                if stats.get("maxHeartRate"):
+                    GARMIN_HEART_RATE_MAX.set(stats["maxHeartRate"])
+                if stats.get("averageStressLevel"):
+                    GARMIN_STRESS_AVG.set(stats["averageStressLevel"])
+                if stats.get("maxStressLevel"):
+                    GARMIN_STRESS_MAX.set(stats["maxStressLevel"])
+                if stats.get("floorsAscended"):
+                    GARMIN_FLOORS_CLIMBED.set(stats["floorsAscended"])
+                if stats.get("moderateIntensityMinutes") or stats.get("vigorousIntensityMinutes"):
+                    moderate = stats.get("moderateIntensityMinutes", 0) or 0
+                    vigorous = stats.get("vigorousIntensityMinutes", 0) or 0
+                    GARMIN_INTENSITY_MINUTES.set(moderate + vigorous)
+        except Exception as e:
+            logger.warning(f"Failed to fetch stats for metrics: {e}")
+
+        # Fetch body battery
+        try:
+            body_battery = garmin_client.get_body_battery(today)
+            if body_battery and isinstance(body_battery, list) and len(body_battery) > 0:
+                # Get the most recent reading
+                latest = body_battery[-1] if body_battery else None
+                if latest:
+                    if latest.get("bodyBatteryLevel"):
+                        GARMIN_BODY_BATTERY.set(latest["bodyBatteryLevel"])
+                # Get charged/drained from the summary if available
+                if len(body_battery) > 0:
+                    first = body_battery[0]
+                    if first.get("bodyBatteryChargedValue"):
+                        GARMIN_BODY_BATTERY_CHARGED.set(first["bodyBatteryChargedValue"])
+                    if first.get("bodyBatteryDrainedValue"):
+                        GARMIN_BODY_BATTERY_DRAINED.set(first["bodyBatteryDrainedValue"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch body battery for metrics: {e}")
+
+        # Fetch sleep data
+        try:
+            sleep = garmin_client.get_sleep_data(today)
+            if sleep:
+                if sleep.get("sleepTimeSeconds"):
+                    GARMIN_SLEEP_SECONDS.set(sleep["sleepTimeSeconds"])
+                if sleep.get("overallSleepScore", {}).get("value"):
+                    GARMIN_SLEEP_SCORE.set(sleep["overallSleepScore"]["value"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch sleep for metrics: {e}")
+
+        # Fetch SpO2
+        try:
+            spo2 = garmin_client.get_spo2_data(today)
+            if spo2 and spo2.get("averageSpO2"):
+                GARMIN_SPO2_AVG.set(spo2["averageSpO2"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch SpO2 for metrics: {e}")
+
+        # Fetch respiration
+        try:
+            resp = garmin_client.get_respiration_data(today)
+            if resp and resp.get("avgWakingRespirationValue"):
+                GARMIN_RESPIRATION_AVG.set(resp["avgWakingRespirationValue"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch respiration for metrics: {e}")
+
+        # Fetch weight (last 30 days)
+        try:
+            end_date = date.today()
+            start_date = end_date - timedelta(days=30)
+            weight_data = garmin_client.get_body_composition(
+                start_date.isoformat(), end_date.isoformat()
+            )
+            if weight_data and weight_data.get("weight"):
+                GARMIN_WEIGHT_KG.set(weight_data["weight"] / 1000)  # Convert grams to kg
+            if weight_data and weight_data.get("bmi"):
+                GARMIN_BMI.set(weight_data["bmi"])
+            if weight_data and weight_data.get("bodyFat"):
+                GARMIN_BODY_FAT_PCT.set(weight_data["bodyFat"])
+        except Exception as e:
+            logger.warning(f"Failed to fetch weight for metrics: {e}")
+
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+else:
+    @app.get("/metrics")
+    async def prometheus_metrics_disabled():
+        """Prometheus metrics are disabled."""
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Prometheus metrics disabled",
+                "detail": "Set ENABLE_PROMETHEUS=true to enable metrics"
+            }
+        )
