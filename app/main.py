@@ -507,11 +507,17 @@ if ENABLE_PROMETHEUS:
         if garmin_client is None:
             return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-        today = date.today().isoformat()
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        today_str = today.isoformat()
+        yesterday_str = yesterday.isoformat()
 
-        # Fetch daily stats
+        # Fetch daily stats (with fallback to yesterday if today has no data)
         try:
-            stats = garmin_client.get_stats(today)
+            stats = garmin_client.get_stats(today_str)
+            # If no meaningful data today, fall back to yesterday
+            if stats and (stats.get("totalSteps") is None or stats.get("totalSteps") == 0):
+                stats = garmin_client.get_stats(yesterday_str)
             if stats:
                 if stats.get("totalSteps"):
                     GARMIN_STEPS.set(stats["totalSteps"])
@@ -540,9 +546,11 @@ if ENABLE_PROMETHEUS:
         except Exception as e:
             logger.warning(f"Failed to fetch stats for metrics: {e}")
 
-        # Fetch body battery
+        # Fetch body battery (try today, fallback to yesterday)
         try:
-            body_battery = garmin_client.get_body_battery(today)
+            body_battery = garmin_client.get_body_battery(today_str)
+            if not body_battery or (isinstance(body_battery, list) and len(body_battery) == 0):
+                body_battery = garmin_client.get_body_battery(yesterday_str)
             if body_battery and isinstance(body_battery, list) and len(body_battery) > 0:
                 # Get the most recent reading
                 latest = body_battery[-1] if body_battery else None
@@ -559,9 +567,11 @@ if ENABLE_PROMETHEUS:
         except Exception as e:
             logger.warning(f"Failed to fetch body battery for metrics: {e}")
 
-        # Fetch sleep data
+        # Fetch sleep data (try today, fallback to yesterday)
         try:
-            sleep = garmin_client.get_sleep_data(today)
+            sleep = garmin_client.get_sleep_data(today_str)
+            if not sleep or not sleep.get("sleepTimeSeconds"):
+                sleep = garmin_client.get_sleep_data(yesterday_str)
             if sleep:
                 if sleep.get("sleepTimeSeconds"):
                     GARMIN_SLEEP_SECONDS.set(sleep["sleepTimeSeconds"])
@@ -570,17 +580,21 @@ if ENABLE_PROMETHEUS:
         except Exception as e:
             logger.warning(f"Failed to fetch sleep for metrics: {e}")
 
-        # Fetch SpO2
+        # Fetch SpO2 (try today, fallback to yesterday)
         try:
-            spo2 = garmin_client.get_spo2_data(today)
+            spo2 = garmin_client.get_spo2_data(today_str)
+            if not spo2 or not spo2.get("averageSpO2"):
+                spo2 = garmin_client.get_spo2_data(yesterday_str)
             if spo2 and spo2.get("averageSpO2"):
                 GARMIN_SPO2_AVG.set(spo2["averageSpO2"])
         except Exception as e:
             logger.warning(f"Failed to fetch SpO2 for metrics: {e}")
 
-        # Fetch respiration
+        # Fetch respiration (try today, fallback to yesterday)
         try:
-            resp = garmin_client.get_respiration_data(today)
+            resp = garmin_client.get_respiration_data(today_str)
+            if not resp or not resp.get("avgWakingRespirationValue"):
+                resp = garmin_client.get_respiration_data(yesterday_str)
             if resp and resp.get("avgWakingRespirationValue"):
                 GARMIN_RESPIRATION_AVG.set(resp["avgWakingRespirationValue"])
         except Exception as e:
