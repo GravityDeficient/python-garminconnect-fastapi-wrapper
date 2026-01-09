@@ -568,15 +568,21 @@ if ENABLE_PROMETHEUS:
             logger.warning(f"Failed to fetch body battery for metrics: {e}")
 
         # Fetch sleep data (try today, fallback to yesterday)
+        # Note: Garmin API returns nested structure under dailySleepDTO
         try:
             sleep = garmin_client.get_sleep_data(today_str)
-            if not sleep or not sleep.get("sleepTimeSeconds"):
+            sleep_dto = sleep.get("dailySleepDTO", {}) if sleep else {}
+            if not sleep_dto or not sleep_dto.get("sleepTimeSeconds"):
                 sleep = garmin_client.get_sleep_data(yesterday_str)
-            if sleep:
-                if sleep.get("sleepTimeSeconds"):
-                    GARMIN_SLEEP_SECONDS.set(sleep["sleepTimeSeconds"])
-                if sleep.get("overallSleepScore", {}).get("value"):
-                    GARMIN_SLEEP_SCORE.set(sleep["overallSleepScore"]["value"])
+                sleep_dto = sleep.get("dailySleepDTO", {}) if sleep else {}
+            if sleep_dto:
+                if sleep_dto.get("sleepTimeSeconds"):
+                    GARMIN_SLEEP_SECONDS.set(sleep_dto["sleepTimeSeconds"])
+                # Sleep score is now under sleepScores.overall.value
+                sleep_scores = sleep_dto.get("sleepScores", {})
+                overall_score = sleep_scores.get("overall", {}).get("value")
+                if overall_score:
+                    GARMIN_SLEEP_SCORE.set(overall_score)
         except Exception as e:
             logger.warning(f"Failed to fetch sleep for metrics: {e}")
 
