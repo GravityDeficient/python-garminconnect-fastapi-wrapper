@@ -37,7 +37,6 @@ spec:
           volumeMounts:
             - name: garmin-tokens
               mountPath: /data/tokens
-              readOnly: true
           resources:
             requests:
               memory: "128Mi"
@@ -59,5 +58,4 @@ spec:
             periodSeconds: 10
       volumes:
         - name: garmin-tokens
-          secret:
-            secretName: garmin-tokens
+          emptyDir: {}

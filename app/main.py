@@ -1,8 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Optional
 import os
 import logging
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 API_KEY = os.getenv("API_KEY")
 
 # Paths that don't require authentication
-PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/redoc", "/openapi.json"}
+PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/redoc", "/openapi.json", "/admin", "/reauth"}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -70,6 +70,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 # Global client instance
 garmin_client: Optional[Garmin] = None
+last_auth_time: Optional[datetime] = None
 
 
 def get_client() -> Garmin:
@@ -110,8 +111,11 @@ def init_garmin_client() -> Garmin:
         raise ValueError("MFA required - run initial auth manually to generate tokens")
 
     # Save tokens for future use
-    client.garth.dump(token_store)
-    logger.info("Logged in with credentials, tokens saved")
+    try:
+        client.garth.dump(token_store)
+        logger.info("Logged in with credentials, tokens saved")
+    except Exception as e:
+        logger.warning(f"Logged in with credentials, but failed to save tokens: {e}")
 
     return client
 
@@ -119,9 +123,10 @@ def init_garmin_client() -> Garmin:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize Garmin client on startup."""
-    global garmin_client
+    global garmin_client, last_auth_time
     try:
         garmin_client = init_garmin_client()
+        last_auth_time = datetime.now()
         logger.info("Garmin client initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize Garmin client: {e}")
@@ -144,6 +149,181 @@ app.add_middleware(APIKeyMiddleware)
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "garmin_connected": garmin_client is not None}
+
+
+# ============ Admin / Re-auth ============
+
+@app.post("/reauth")
+async def reauth():
+    """Re-authenticate with Garmin Connect."""
+    global garmin_client, last_auth_time
+    try:
+        garmin_client = init_garmin_client()
+        last_auth_time = datetime.now()
+        logger.info("Re-authentication successful")
+        return {"status": "ok", "message": "Re-authenticated successfully"}
+    except Exception as e:
+        logger.error(f"Re-authentication failed: {e}")
+        garmin_client = None
+        raise HTTPException(status_code=500, detail=f"Re-authentication failed: {e}")
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    """Admin dashboard with connection status and re-auth button."""
+    connected = garmin_client is not None
+    auth_time_str = last_auth_time.strftime("%Y-%m-%d %I:%M %p %Z") if last_auth_time else "Never"
+    status_color = "#4ade80" if connected else "#f87171"
+    status_text = "Connected" if connected else "Disconnected"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Garmin Connect API - Admin</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .card {{
+            background: #1e293b;
+            border-radius: 16px;
+            padding: 2.5rem;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,.5);
+        }}
+        h1 {{
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1.5rem;
+            color: #f8fafc;
+        }}
+        .status-row {{
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.75rem;
+        }}
+        .status-dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: {status_color};
+            flex-shrink: 0;
+        }}
+        .status-dot.connected {{ animation: pulse 2s infinite; }}
+        @keyframes pulse {{
+            0%, 100% {{ opacity: 1; }}
+            50% {{ opacity: .5; }}
+        }}
+        .label {{ color: #94a3b8; font-size: 0.875rem; }}
+        .value {{ color: #f8fafc; font-size: 0.875rem; }}
+        .info {{
+            background: #0f172a;
+            border-radius: 10px;
+            padding: 1rem;
+            margin: 1.25rem 0;
+        }}
+        .info-row {{
+            display: flex;
+            justify-content: space-between;
+            padding: 0.35rem 0;
+        }}
+        button {{
+            width: 100%;
+            padding: 0.85rem;
+            border: none;
+            border-radius: 10px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.15s;
+            background: #3b82f6;
+            color: white;
+        }}
+        button:hover {{ background: #2563eb; }}
+        button:active {{ transform: scale(0.98); }}
+        button:disabled {{
+            background: #475569;
+            cursor: not-allowed;
+            transform: none;
+        }}
+        .result {{
+            margin-top: 1rem;
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            font-size: 0.875rem;
+            display: none;
+        }}
+        .result.success {{ background: #14532d; color: #86efac; display: block; }}
+        .result.error {{ background: #7f1d1d; color: #fca5a5; display: block; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Garmin Connect API</h1>
+        <div class="status-row">
+            <div class="status-dot {"connected" if connected else ""}" id="dot"></div>
+            <span class="value" id="status">{status_text}</span>
+        </div>
+        <div class="info">
+            <div class="info-row">
+                <span class="label">Last Auth</span>
+                <span class="value" id="auth-time">{auth_time_str}</span>
+            </div>
+        </div>
+        <button id="reauth-btn" onclick="reauth()">Re-authenticate</button>
+        <div class="result" id="result"></div>
+    </div>
+    <script>
+        async function reauth() {{
+            const btn = document.getElementById('reauth-btn');
+            const result = document.getElementById('result');
+            const dot = document.getElementById('dot');
+            const status = document.getElementById('status');
+            const authTime = document.getElementById('auth-time');
+
+            btn.disabled = true;
+            btn.textContent = 'Authenticating...';
+            result.className = 'result';
+            result.style.display = 'none';
+
+            try {{
+                const resp = await fetch('/reauth', {{ method: 'POST' }});
+                const data = await resp.json();
+                if (resp.ok) {{
+                    result.textContent = data.message;
+                    result.className = 'result success';
+                    dot.className = 'status-dot connected';
+                    dot.style.background = '#4ade80';
+                    status.textContent = 'Connected';
+                    authTime.textContent = new Date().toLocaleString();
+                }} else {{
+                    result.textContent = data.detail || 'Re-authentication failed';
+                    result.className = 'result error';
+                    dot.className = 'status-dot';
+                    dot.style.background = '#f87171';
+                    status.textContent = 'Disconnected';
+                }}
+            }} catch (e) {{
+                result.textContent = 'Network error: ' + e.message;
+                result.className = 'result error';
+            }}
+            btn.disabled = false;
+            btn.textContent = 'Re-authenticate';
+        }}
+    </script>
+</body>
+</html>"""
 
 
 # ============ Daily Stats ============
