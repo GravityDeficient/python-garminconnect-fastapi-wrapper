@@ -8,6 +8,7 @@ import os
 import logging
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
+from garth import sso as garth_sso
 
 # Prometheus metrics (optional)
 ENABLE_PROMETHEUS = os.getenv("ENABLE_PROMETHEUS", "false").lower() == "true"
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 API_KEY = os.getenv("API_KEY")
 
 # Paths that don't require authentication
-PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/redoc", "/openapi.json", "/admin", "/reauth"}
+PUBLIC_PATHS = {"/health", "/metrics", "/docs", "/redoc", "/openapi.json", "/admin", "/reauth", "/reauth/mfa"}
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
@@ -72,6 +73,9 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 garmin_client: Optional[Garmin] = None
 last_auth_time: Optional[datetime] = None
 
+# Pending MFA state (holds partially-authenticated client)
+_mfa_pending: Optional[dict] = None
+
 
 def get_client() -> Garmin:
     """Dependency to get authenticated Garmin client."""
@@ -80,56 +84,48 @@ def get_client() -> Garmin:
     return garmin_client
 
 
-def init_garmin_client() -> Garmin:
-    """Initialize and authenticate Garmin client."""
-    email = os.getenv("GARMIN_EMAIL")
-    password = os.getenv("GARMIN_PASSWORD")
-    token_store = os.getenv("GARMIN_TOKEN_STORE", "/data/tokens")
+def get_token_store() -> str:
+    return os.getenv("GARMIN_TOKEN_STORE", "/data/tokens")
 
-    if not email or not password:
-        raise ValueError("GARMIN_EMAIL and GARMIN_PASSWORD environment variables required")
 
+def try_token_login() -> Optional[Garmin]:
+    """Try to login using saved tokens. Returns client or None."""
+    token_store = get_token_store()
     os.makedirs(token_store, exist_ok=True)
-
-    # Try to load saved tokens first
     try:
         client = Garmin()
         client.login(token_store)
-        # Fetch display name to initialize user context
         display_name = client.get_full_name()
         logger.info(f"Logged in using saved tokens as {display_name}")
         return client
     except Exception as e:
-        logger.info(f"Token load failed ({e}), doing fresh login...")
+        logger.info(f"Token load failed ({e})")
+        return None
 
-    # Fresh login with credentials
-    client = Garmin(email=email, password=password)
-    result = client.login()
 
-    # Handle MFA if needed
-    if isinstance(result, tuple) and result[0] == "needs_mfa":
-        raise ValueError("MFA required - run initial auth manually to generate tokens")
-
-    # Save tokens for future use
+def save_tokens(client: Garmin):
+    """Save garth tokens to disk."""
+    token_store = get_token_store()
     try:
         client.garth.dump(token_store)
-        logger.info("Logged in with credentials, tokens saved")
+        logger.info("Tokens saved to disk")
     except Exception as e:
-        logger.warning(f"Logged in with credentials, but failed to save tokens: {e}")
-
-    return client
+        logger.warning(f"Failed to save tokens: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize Garmin client on startup."""
+    """Initialize Garmin client on startup using saved tokens."""
     global garmin_client, last_auth_time
-    try:
-        garmin_client = init_garmin_client()
+    client = try_token_login()
+    if client:
+        garmin_client = client
         last_auth_time = datetime.now()
-        logger.info("Garmin client initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize Garmin client: {e}")
+        logger.info("Garmin client initialized from saved tokens")
+    else:
+        logger.warning(
+            "Garmin client not initialized - visit /admin to authenticate"
+        )
     yield
     garmin_client = None
 
@@ -155,24 +151,111 @@ async def health_check():
 
 @app.post("/reauth")
 async def reauth():
-    """Re-authenticate with Garmin Connect."""
-    global garmin_client, last_auth_time
-    try:
-        garmin_client = init_garmin_client()
+    """Start re-authentication with Garmin Connect.
+
+    First tries saved tokens. If that fails, starts credential login
+    which may require MFA. Returns status: ok, mfa_required, or error.
+    """
+    global garmin_client, last_auth_time, _mfa_pending
+
+    # Try saved tokens first
+    client = try_token_login()
+    if client:
+        garmin_client = client
         last_auth_time = datetime.now()
-        logger.info("Re-authentication successful")
+        save_tokens(client)
+        return {"status": "ok", "message": "Re-authenticated using saved tokens"}
+
+    # Start credential login with MFA support
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
+    if not email or not password:
+        raise HTTPException(status_code=500, detail="GARMIN_EMAIL/PASSWORD not configured")
+
+    try:
+        client = Garmin(email=email, password=password, return_on_mfa=True)
+        result = client.login()
+
+        if isinstance(result, tuple) and result[0] == "needs_mfa":
+            _mfa_pending = {"client": client, "mfa_data": result[1]}
+            logger.info("MFA required for re-authentication")
+            return {"status": "mfa_required", "message": "Enter MFA code from your authenticator app"}
+
+        # No MFA needed — login succeeded
+        garmin_client = client
+        last_auth_time = datetime.now()
+        save_tokens(client)
+        logger.info("Re-authentication successful (no MFA)")
         return {"status": "ok", "message": "Re-authenticated successfully"}
     except Exception as e:
         logger.error(f"Re-authentication failed: {e}")
-        garmin_client = None
+        _mfa_pending = None
         raise HTTPException(status_code=500, detail=f"Re-authentication failed: {e}")
+
+
+@app.post("/reauth/mfa")
+async def reauth_mfa(request: Request):
+    """Complete MFA step of re-authentication."""
+    global garmin_client, last_auth_time, _mfa_pending
+
+    if not _mfa_pending:
+        raise HTTPException(
+            status_code=400,
+            detail="No MFA session pending. Start with POST /reauth first.",
+        )
+
+    body = await request.json()
+    mfa_code = body.get("code", "").strip()
+    if not mfa_code:
+        raise HTTPException(status_code=400, detail="MFA code is required")
+
+    garmin_obj = _mfa_pending["client"]
+    mfa_data = _mfa_pending["mfa_data"]
+    garth_client = mfa_data["client"]
+    signin_params = mfa_data["signin_params"]
+
+    try:
+        # Submit MFA code via garth SSO
+        garth_sso.handle_mfa(garth_client, signin_params, lambda: mfa_code)
+        title = garth_sso.get_title(garth_client.last_resp.text)
+        if title != "Success":
+            raise Exception(f"MFA verification failed: {title}")
+
+        # Complete OAuth token exchange
+        oauth1, oauth2 = garth_sso._complete_login(garth_client)
+        garmin_obj.garth.oauth1_token = oauth1
+        garmin_obj.garth.oauth2_token = oauth2
+
+        # Load profile to finish garminconnect initialization
+        profile = garmin_obj.garth.connectapi(
+            "/userprofile-service/userprofile/profile"
+        )
+        garmin_obj.display_name = profile.get("displayName")
+        garmin_obj.full_name = profile.get("fullName")
+        settings = garmin_obj.garth.connectapi(
+            garmin_obj.garmin_connect_user_settings_url
+        )
+        garmin_obj.unit_system = settings.get("userData", {}).get(
+            "measurementSystem"
+        )
+
+        garmin_client = garmin_obj
+        last_auth_time = datetime.now()
+        save_tokens(garmin_obj)
+        _mfa_pending = None
+        logger.info(f"MFA authentication successful as {garmin_obj.display_name}")
+        return {"status": "ok", "message": "MFA authentication successful"}
+    except Exception as e:
+        logger.error(f"MFA authentication failed: {e}")
+        _mfa_pending = None
+        raise HTTPException(status_code=500, detail=f"MFA failed: {e}")
 
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page():
-    """Admin dashboard with connection status and re-auth button."""
+    """Admin dashboard with connection status, re-auth, and MFA support."""
     connected = garmin_client is not None
-    auth_time_str = last_auth_time.strftime("%Y-%m-%d %I:%M %p %Z") if last_auth_time else "Never"
+    auth_time_str = last_auth_time.strftime("%Y-%m-%d %I:%M %p") if last_auth_time else "Never"
     status_color = "#4ade80" if connected else "#f87171"
     status_text = "Connected" if connected else "Disconnected"
 
@@ -181,7 +264,7 @@ async def admin_page():
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Garmin Connect API - Admin</title>
+    <title>Garmin Connect API</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -192,6 +275,7 @@ async def admin_page():
             display: flex;
             align-items: center;
             justify-content: center;
+            padding: 1rem;
         }}
         .card {{
             background: #1e293b;
@@ -201,78 +285,50 @@ async def admin_page():
             max-width: 420px;
             box-shadow: 0 25px 50px -12px rgba(0,0,0,.5);
         }}
-        h1 {{
-            font-size: 1.25rem;
-            font-weight: 600;
-            margin-bottom: 1.5rem;
-            color: #f8fafc;
+        h1 {{ font-size: 1.25rem; font-weight: 600; margin-bottom: 1.5rem; color: #f8fafc; }}
+        .status-row {{ display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }}
+        .dot {{
+            width: 12px; height: 12px; border-radius: 50%;
+            background: {status_color}; flex-shrink: 0;
         }}
-        .status-row {{
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            margin-bottom: 0.75rem;
-        }}
-        .status-dot {{
-            width: 12px;
-            height: 12px;
-            border-radius: 50%;
-            background: {status_color};
-            flex-shrink: 0;
-        }}
-        .status-dot.connected {{ animation: pulse 2s infinite; }}
-        @keyframes pulse {{
-            0%, 100% {{ opacity: 1; }}
-            50% {{ opacity: .5; }}
-        }}
+        .dot.on {{ animation: pulse 2s infinite; }}
+        @keyframes pulse {{ 0%,100% {{ opacity:1 }} 50% {{ opacity:.5 }} }}
         .label {{ color: #94a3b8; font-size: 0.875rem; }}
         .value {{ color: #f8fafc; font-size: 0.875rem; }}
-        .info {{
-            background: #0f172a;
-            border-radius: 10px;
-            padding: 1rem;
-            margin: 1.25rem 0;
-        }}
-        .info-row {{
-            display: flex;
-            justify-content: space-between;
-            padding: 0.35rem 0;
-        }}
+        .info {{ background: #0f172a; border-radius: 10px; padding: 1rem; margin: 1.25rem 0; }}
+        .info-row {{ display: flex; justify-content: space-between; padding: 0.35rem 0; }}
         button {{
-            width: 100%;
-            padding: 0.85rem;
-            border: none;
-            border-radius: 10px;
-            font-size: 0.95rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all 0.15s;
-            background: #3b82f6;
-            color: white;
+            width: 100%; padding: 0.85rem; border: none; border-radius: 10px;
+            font-size: 0.95rem; font-weight: 600; cursor: pointer;
+            transition: all 0.15s; background: #3b82f6; color: white;
         }}
         button:hover {{ background: #2563eb; }}
         button:active {{ transform: scale(0.98); }}
-        button:disabled {{
-            background: #475569;
-            cursor: not-allowed;
-            transform: none;
+        button:disabled {{ background: #475569; cursor: not-allowed; transform: none; }}
+        .msg {{
+            margin-top: 1rem; padding: 0.75rem 1rem; border-radius: 8px;
+            font-size: 0.875rem; display: none;
         }}
-        .result {{
-            margin-top: 1rem;
-            padding: 0.75rem 1rem;
-            border-radius: 8px;
-            font-size: 0.875rem;
-            display: none;
+        .msg.ok {{ background: #14532d; color: #86efac; display: block; }}
+        .msg.err {{ background: #7f1d1d; color: #fca5a5; display: block; }}
+        .msg.info {{ background: #1e3a5f; color: #93c5fd; display: block; }}
+        .mfa-group {{ margin-top: 1rem; display: none; }}
+        .mfa-group.show {{ display: block; }}
+        .mfa-input {{
+            width: 100%; padding: 0.85rem; border: 2px solid #334155;
+            border-radius: 10px; background: #0f172a; color: #f8fafc;
+            font-size: 1.25rem; text-align: center; letter-spacing: 0.5rem;
+            margin-bottom: 0.75rem; outline: none;
         }}
-        .result.success {{ background: #14532d; color: #86efac; display: block; }}
-        .result.error {{ background: #7f1d1d; color: #fca5a5; display: block; }}
+        .mfa-input:focus {{ border-color: #3b82f6; }}
+        .mfa-label {{ color: #94a3b8; font-size: 0.8rem; margin-bottom: 0.5rem; }}
     </style>
 </head>
 <body>
     <div class="card">
         <h1>Garmin Connect API</h1>
         <div class="status-row">
-            <div class="status-dot {"connected" if connected else ""}" id="dot"></div>
+            <div class="dot {"on" if connected else ""}" id="dot"></div>
             <span class="value" id="status">{status_text}</span>
         </div>
         <div class="info">
@@ -282,44 +338,89 @@ async def admin_page():
             </div>
         </div>
         <button id="reauth-btn" onclick="reauth()">Re-authenticate</button>
-        <div class="result" id="result"></div>
+        <div class="mfa-group" id="mfa-group">
+            <div class="mfa-label">Enter the code from your authenticator app</div>
+            <input class="mfa-input" id="mfa-code" type="text" inputmode="numeric"
+                   maxlength="6" placeholder="------" autocomplete="one-time-code"
+                   onkeydown="if(event.key==='Enter')submitMfa()">
+            <button id="mfa-btn" onclick="submitMfa()">Verify Code</button>
+        </div>
+        <div class="msg" id="msg"></div>
     </div>
     <script>
-        async function reauth() {{
-            const btn = document.getElementById('reauth-btn');
-            const result = document.getElementById('result');
-            const dot = document.getElementById('dot');
-            const status = document.getElementById('status');
-            const authTime = document.getElementById('auth-time');
+        const $ = id => document.getElementById(id);
 
+        function setConnected(ok) {{
+            $('dot').className = ok ? 'dot on' : 'dot';
+            $('dot').style.background = ok ? '#4ade80' : '#f87171';
+            $('status').textContent = ok ? 'Connected' : 'Disconnected';
+            if (ok) $('auth-time').textContent = new Date().toLocaleString();
+        }}
+
+        function showMsg(text, type) {{
+            const m = $('msg');
+            m.textContent = text;
+            m.className = 'msg ' + type;
+        }}
+
+        async function reauth() {{
+            const btn = $('reauth-btn');
             btn.disabled = true;
             btn.textContent = 'Authenticating...';
-            result.className = 'result';
-            result.style.display = 'none';
+            $('msg').className = 'msg';
+            $('mfa-group').className = 'mfa-group';
 
             try {{
                 const resp = await fetch('/reauth', {{ method: 'POST' }});
                 const data = await resp.json();
-                if (resp.ok) {{
-                    result.textContent = data.message;
-                    result.className = 'result success';
-                    dot.className = 'status-dot connected';
-                    dot.style.background = '#4ade80';
-                    status.textContent = 'Connected';
-                    authTime.textContent = new Date().toLocaleString();
+                if (data.status === 'ok') {{
+                    showMsg(data.message, 'ok');
+                    setConnected(true);
+                }} else if (data.status === 'mfa_required') {{
+                    showMsg(data.message, 'info');
+                    $('mfa-group').className = 'mfa-group show';
+                    $('mfa-code').value = '';
+                    $('mfa-code').focus();
+                    btn.textContent = 'Re-authenticate';
+                    btn.disabled = false;
+                    return;
                 }} else {{
-                    result.textContent = data.detail || 'Re-authentication failed';
-                    result.className = 'result error';
-                    dot.className = 'status-dot';
-                    dot.style.background = '#f87171';
-                    status.textContent = 'Disconnected';
+                    showMsg(data.detail || 'Failed', 'err');
+                    setConnected(false);
                 }}
             }} catch (e) {{
-                result.textContent = 'Network error: ' + e.message;
-                result.className = 'result error';
+                showMsg('Network error: ' + e.message, 'err');
             }}
             btn.disabled = false;
             btn.textContent = 'Re-authenticate';
+        }}
+
+        async function submitMfa() {{
+            const code = $('mfa-code').value.trim();
+            if (!code) return;
+            const btn = $('mfa-btn');
+            btn.disabled = true;
+            btn.textContent = 'Verifying...';
+
+            try {{
+                const resp = await fetch('/reauth/mfa', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ code }})
+                }});
+                const data = await resp.json();
+                if (resp.ok) {{
+                    showMsg(data.message, 'ok');
+                    setConnected(true);
+                    $('mfa-group').className = 'mfa-group';
+                }} else {{
+                    showMsg(data.detail || 'MFA failed', 'err');
+                }}
+            }} catch (e) {{
+                showMsg('Network error: ' + e.message, 'err');
+            }}
+            btn.disabled = false;
+            btn.textContent = 'Verify Code';
         }}
     </script>
 </body>
