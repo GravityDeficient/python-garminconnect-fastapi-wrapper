@@ -4,11 +4,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from typing import Optional
+import asyncio
 import os
 import logging
+import threading
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
-from garth import sso as garth_sso
 
 # Prometheus metrics (optional)
 ENABLE_PROMETHEUS = os.getenv("ENABLE_PROMETHEUS", "false").lower() == "true"
@@ -73,8 +74,10 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 garmin_client: Optional[Garmin] = None
 last_auth_time: Optional[datetime] = None
 
-# Pending MFA state (holds partially-authenticated client)
-_mfa_pending: Optional[dict] = None
+# MFA flow state: background thread blocks on _mfa_event waiting for code
+_mfa_event: Optional[threading.Event] = None
+_mfa_code: Optional[str] = None
+_mfa_result: Optional[dict] = None  # {"status": "ok"/"error", "message": ...}
 
 
 def get_client() -> Garmin:
@@ -149,14 +152,44 @@ async def health_check():
 
 # ============ Admin / Re-auth ============
 
+def _mfa_prompt() -> str:
+    """Callback passed to garth's SSO login. Blocks until MFA code arrives."""
+    global _mfa_code
+    logger.info("MFA required — waiting for code via /reauth/mfa...")
+    _mfa_event.wait(timeout=300)  # 5 minute timeout
+    if not _mfa_code:
+        raise Exception("MFA code was not provided within timeout")
+    code = _mfa_code
+    _mfa_code = None
+    return code
+
+
+def _do_credential_login():
+    """Run credential login in a background thread (may block on MFA)."""
+    global garmin_client, last_auth_time, _mfa_result
+    email = os.getenv("GARMIN_EMAIL")
+    password = os.getenv("GARMIN_PASSWORD")
+    try:
+        client = Garmin(email=email, password=password, prompt_mfa=_mfa_prompt)
+        client.login()
+        garmin_client = client
+        last_auth_time = datetime.now()
+        save_tokens(client)
+        _mfa_result = {"status": "ok", "message": f"Authenticated as {client.display_name}"}
+        logger.info(f"Authentication successful as {client.display_name}")
+    except Exception as e:
+        logger.error(f"Authentication failed: {e}")
+        _mfa_result = {"status": "error", "message": str(e)}
+
+
 @app.post("/reauth")
 async def reauth():
     """Start re-authentication with Garmin Connect.
 
     First tries saved tokens. If that fails, starts credential login
-    which may require MFA. Returns status: ok, mfa_required, or error.
+    in a background thread (which will block if MFA is needed).
     """
-    global garmin_client, last_auth_time, _mfa_pending
+    global garmin_client, last_auth_time, _mfa_event, _mfa_code, _mfa_result
 
     # Try saved tokens first
     client = try_token_login()
@@ -166,89 +199,73 @@ async def reauth():
         save_tokens(client)
         return {"status": "ok", "message": "Re-authenticated using saved tokens"}
 
-    # Start credential login with MFA support
+    # Start credential login in background thread
     email = os.getenv("GARMIN_EMAIL")
     password = os.getenv("GARMIN_PASSWORD")
     if not email or not password:
-        raise HTTPException(status_code=500, detail="GARMIN_EMAIL/PASSWORD not configured")
+        raise HTTPException(
+            status_code=500, detail="GARMIN_EMAIL/PASSWORD not configured"
+        )
 
-    try:
-        client = Garmin(email=email, password=password, return_on_mfa=True)
-        result = client.login()
+    _mfa_event = threading.Event()
+    _mfa_code = None
+    _mfa_result = None
 
-        if isinstance(result, tuple) and result[0] == "needs_mfa":
-            _mfa_pending = {"client": client, "mfa_data": result[1]}
-            logger.info("MFA required for re-authentication")
-            return {"status": "mfa_required", "message": "Enter MFA code from your authenticator app"}
+    thread = threading.Thread(target=_do_credential_login, daemon=True)
+    thread.start()
 
-        # No MFA needed — login succeeded
-        garmin_client = client
-        last_auth_time = datetime.now()
-        save_tokens(client)
-        logger.info("Re-authentication successful (no MFA)")
-        return {"status": "ok", "message": "Re-authenticated successfully"}
-    except Exception as e:
-        logger.error(f"Re-authentication failed: {e}")
-        _mfa_pending = None
-        raise HTTPException(status_code=500, detail=f"Re-authentication failed: {e}")
+    # Wait briefly to see if login completes without MFA
+    thread.join(timeout=15)
+
+    if _mfa_result:
+        # Login completed (no MFA needed or fast MFA)
+        _mfa_event = None
+        if _mfa_result["status"] == "ok":
+            return _mfa_result
+        raise HTTPException(status_code=500, detail=_mfa_result["message"])
+
+    # Thread is still alive — blocked on MFA prompt
+    logger.info("MFA required for re-authentication")
+    return {
+        "status": "mfa_required",
+        "message": "Enter MFA code from your authenticator app",
+    }
 
 
 @app.post("/reauth/mfa")
 async def reauth_mfa(request: Request):
-    """Complete MFA step of re-authentication."""
-    global garmin_client, last_auth_time, _mfa_pending
+    """Submit MFA code to complete authentication."""
+    global _mfa_event, _mfa_code, _mfa_result
 
-    if not _mfa_pending:
+    if not _mfa_event:
         raise HTTPException(
             status_code=400,
             detail="No MFA session pending. Start with POST /reauth first.",
         )
 
     body = await request.json()
-    mfa_code = body.get("code", "").strip()
-    if not mfa_code:
+    code = body.get("code", "").strip()
+    if not code:
         raise HTTPException(status_code=400, detail="MFA code is required")
 
-    garmin_obj = _mfa_pending["client"]
-    mfa_data = _mfa_pending["mfa_data"]
-    garth_client = mfa_data["client"]
-    signin_params = mfa_data["signin_params"]
+    # Provide the code to the blocked background thread
+    _mfa_code = code
+    _mfa_event.set()
 
-    try:
-        # Submit MFA code via garth SSO
-        garth_sso.handle_mfa(garth_client, signin_params, lambda: mfa_code)
-        title = garth_sso.get_title(garth_client.last_resp.text)
-        if title != "Success":
-            raise Exception(f"MFA verification failed: {title}")
+    # Wait for the login thread to complete
+    for _ in range(30):
+        await asyncio.sleep(0.5)
+        if _mfa_result:
+            break
 
-        # Complete OAuth token exchange
-        oauth1, oauth2 = garth_sso._complete_login(garth_client)
-        garmin_obj.garth.oauth1_token = oauth1
-        garmin_obj.garth.oauth2_token = oauth2
+    _mfa_event = None
 
-        # Load profile to finish garminconnect initialization
-        profile = garmin_obj.garth.connectapi(
-            "/userprofile-service/userprofile/profile"
-        )
-        garmin_obj.display_name = profile.get("displayName")
-        garmin_obj.full_name = profile.get("fullName")
-        settings = garmin_obj.garth.connectapi(
-            garmin_obj.garmin_connect_user_settings_url
-        )
-        garmin_obj.unit_system = settings.get("userData", {}).get(
-            "measurementSystem"
-        )
+    if not _mfa_result:
+        raise HTTPException(status_code=504, detail="Login timed out after MFA")
 
-        garmin_client = garmin_obj
-        last_auth_time = datetime.now()
-        save_tokens(garmin_obj)
-        _mfa_pending = None
-        logger.info(f"MFA authentication successful as {garmin_obj.display_name}")
-        return {"status": "ok", "message": "MFA authentication successful"}
-    except Exception as e:
-        logger.error(f"MFA authentication failed: {e}")
-        _mfa_pending = None
-        raise HTTPException(status_code=500, detail=f"MFA failed: {e}")
+    if _mfa_result["status"] == "ok":
+        return _mfa_result
+    raise HTTPException(status_code=500, detail=_mfa_result["message"])
 
 
 @app.get("/admin", response_class=HTMLResponse)
