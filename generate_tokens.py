@@ -16,16 +16,15 @@ def main():
 
     print(f"\nAuthenticating as {email}...")
     client = Garmin(email=email, password=password, is_cn=False, return_on_mfa=True)
-    result1, result2 = client.login()
+    result1, result2 = client.login(token_store)
 
     # Handle MFA
     if result1 == "needs_mfa":
         print("\nMFA required!")
         mfa_code = input("Enter the MFA code from your phone/email: ")
         client.resume_login(result2, mfa_code)
+        client.client.dump(token_store)
 
-    # Save tokens
-    client.garth.dump(token_store)
     print(f"\nTokens saved to {token_store}/")
     print("You can now start the FastAPI service.")
 

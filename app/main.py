@@ -107,10 +107,15 @@ def try_token_login() -> Optional[Garmin]:
 
 
 def save_tokens(client: Garmin):
-    """Save garth tokens to disk."""
+    """Persist tokens to disk.
+
+    In garminconnect 0.3.x the underlying client persists automatically when
+    login() is called with a tokenstore path, so we just call dump() on the
+    inner client to cover refresh-after-load. garth is gone.
+    """
     token_store = get_token_store()
     try:
-        client.garth.dump(token_store)
+        client.client.dump(token_store)
         logger.info("Tokens saved to disk")
     except Exception as e:
         logger.warning(f"Failed to save tokens: {e}")
@@ -171,7 +176,7 @@ def _do_credential_login():
     password = os.getenv("GARMIN_PASSWORD")
     try:
         client = Garmin(email=email, password=password, prompt_mfa=_mfa_prompt)
-        client.login()
+        client.login(get_token_store())
         garmin_client = client
         last_auth_time = datetime.now()
         save_tokens(client)

@@ -1,9 +1,9 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install timezone data
-RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+# tzdata for local time, git for installing garminconnect from master until 0.3.x lands on PyPI
+RUN apt-get update && apt-get install -y tzdata git && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
 COPY requirements.txt .
